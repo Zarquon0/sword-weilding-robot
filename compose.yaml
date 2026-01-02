@@ -1,0 +1,11 @@
+services:
+  sword-weilding-robot:
+    build: .
+    image: sword-weilding-robot
+    container_name: swr-box
+    ports:
+      - "10000:10000"
+    volumes:
+      - ./src:/root/sword-weilding-robot/src
+    stdin_open: true
+    tty: true
