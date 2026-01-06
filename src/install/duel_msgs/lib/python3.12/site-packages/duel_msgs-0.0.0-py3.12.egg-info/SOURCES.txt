@@ -1,0 +1,6 @@
+setup.py
+duel_msgs/__init__.py
+duel_msgs.egg-info/PKG-INFO
+duel_msgs.egg-info/SOURCES.txt
+duel_msgs.egg-info/dependency_links.txt
+duel_msgs.egg-info/top_level.txt

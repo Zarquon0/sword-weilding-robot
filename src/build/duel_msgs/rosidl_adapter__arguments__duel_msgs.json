@@ -1,0 +1,6 @@
+{
+  "package_name": "duel_msgs",
+  "non_idl_tuples": [
+    "/root/sword-weilding-robot/src/duel_msgs:msg/DuelBotObservation.msg"
+  ]
+}
