@@ -1,0 +1,73 @@
+import rclpy
+from rclpy.node import Node
+from std_msgs.msg import Float64MultiArray
+from duel_msgs.msg import DuelBotObservation
+import numpy as np
+
+OBSERVATION_TOPIC = "arm_observations"
+COMMAND_TOPIC = "arm_command_targets"
+QUEUE_LENGTH = 10
+# FREQUENCY = 20 # In hertz
+
+class ArmCommander(Node):
+    def __init__(self):
+        super().__init__('arm_controller')
+        self.subscription  = self.create_subscription(DuelBotObservation, OBSERVATION_TOPIC, self.observation_response, QUEUE_LENGTH)
+        self._publisher = self.create_publisher(Float64MultiArray, COMMAND_TOPIC, QUEUE_LENGTH)
+        #self.timer = self.create_timer(1 // FREQUENCY, self.timer_callback) 
+
+    # NOTE: Not used currently for readability's sake
+    def _flatten_message(self, msg: DuelBotObservation):
+        """
+        Recursively unpacks a ROS message into a flat list of floats.
+        Handles nested types (Vector3, Quaternion) and arrays automatically.
+        """
+        flat_list = []
+        for field_name in msg.get_fields_and_field_types().keys():
+            value = getattr(msg, field_name)
+            if hasattr(value, 'get_fields_and_field_types'): # Nested ROS message
+                flat_list.extend(self.flatten_message(value))
+            elif isinstance(value, (list, tuple, np.ndarray)): # Nested data non-atomic data structure
+                flat_list.extend(value)
+            else: # Atomic value
+                flat_list.append(float(value))
+        return flat_list
+
+    def observation_response(self, msg: DuelBotObservation):
+        # Combine all data into an array for training
+        model_ipts = [
+            msg.relative_target_position.x, msg.relative_target_position.y, msg.relative_target_position.z,
+            msg.sword_rotation.x, msg.sword_rotation.y, msg.sword_rotation.z, msg.sword_rotation.w,
+            msg.shoulder_rotation.x, msg.shoulder_rotation.y, msg.shoulder_rotation.z, msg.shoulder_rotation.w,
+            msg.elbow_rotation,
+            msg.wrist_rotation.x, msg.wrist_rotation.y, msg.wrist_rotation.z, msg.wrist_rotation.w,
+            msg.shoulder_vel.x, msg.shoulder_vel.y, msg.shoulder_vel.z,
+            msg.elbow_vel,
+            msg.wrist_vel.x, msg.wrist_vel.y, msg.wrist_vel.z
+        ]
+        model_ipts = np.array(model_ipts, dtype=float)
+        # Run the model to see the output
+        model_outs = self.run_model(model_ipts)
+        # Publish the command message based off of the model's output
+        to_publish = Float64MultiArray()
+        to_publish.data = model_outs.tolist()
+        print("Publishing", model_outs.tolist())
+        self._publisher.publish(to_publish)
+
+    def run_model(self, ipts: np.ndarray[float]) -> np.ndarray[float]:  
+        # Normally, we'd run the model here but for now, just some rando data
+        return np.random.uniform(-1.0, 1.0, 7)
+
+def main():
+    rclpy.init()
+    node = ArmCommander()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == "__main__":
+    main()
