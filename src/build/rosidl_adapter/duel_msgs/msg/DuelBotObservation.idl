@@ -29,6 +29,10 @@ module duel_msgs {
       float elbow_vel;
 
       geometry_msgs::msg::Vector3 wrist_vel;
+
+      @verbatim (language="comment", text=
+        "Hit signal")
+      boolean hit_target;
     };
   };
 };

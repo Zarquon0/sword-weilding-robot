@@ -9,3 +9,5 @@ geometry_msgs/Quaternion wrist_rotation
 geometry_msgs/Vector3 shoulder_vel
 float32 elbow_vel
 geometry_msgs/Vector3 wrist_vel
+# Hit signal
+bool hit_target
