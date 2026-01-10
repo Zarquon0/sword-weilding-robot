@@ -6,18 +6,22 @@ RUN apt-get update && apt-get install -y \
     git \
     python3-pip \
     python3-colcon-common-extensions \
+    python3-venv \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. Create the Colcon Workspace
 WORKDIR /root/sword-weilding-robot/src
 
-# 3. Clone the Unity TCP Endpoint Interface
-# (This is the ROS side of the bridge)
-RUN git clone -b main-ros2 https://github.com/Unity-Technologies/ROS-TCP-Endpoint.git
-
-# 4. Build the Workspace
+# Create the python virtual environment and install requirements
 WORKDIR /root/sword-weilding-robot
 SHELL ["/bin/bash", "-c"]
+ENV VENV_PATH=/root/sword-weilding-robot/.venv
+RUN python3 -m venv $VENV_PATH --system-site-packages
+COPY requirements.txt .
+RUN $VENV_PATH/bin/pip install --upgrade pip && \
+    $VENV_PATH/bin/pip install -r requirements.txt
+
+# Build the workspace
 RUN source /opt/ros/jazzy/setup.bash && colcon build
 
 # 5. Add the workspace to the bash entrypoint so it sources automatically

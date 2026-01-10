@@ -5,25 +5,107 @@ from duel_msgs.msg import DuelBotObservation
 from std_srvs.srv import Trigger
 from rclpy.task import Future   
 import numpy as np
+from dataclasses import dataclass
+
+from actor_critic import ActorCritic
+import torch
 
 OBSERVATION_TOPIC = "arm_observations"
 COMMAND_TOPIC = "arm_command_targets"
 RESET_SERVICE = "duel_bot/reset"
 QUEUE_LENGTH = 10
+OUTPUT_SIZE = 7
 # FREQUENCY = 20 # In hertz
+BLADE_LENGTH = 0.7  # Meters 
+BLADE_AXIS_LOCAL = [0, 0, -1] # -Z
+
+@dataclass()
+class RolloutRecord:
+    obs: torch.Tensor
+    action: torch.Tensor
+    log_prob: float
+    value: float
+    reward: float | None
+    done: bool | None
 
 class ArmCommander(Node):
     def __init__(self):
+        # Initialize important control state
+        self.model: ActorCritic | None = None
+        self.is_running = False
+        self.is_resetting = False
+        self.device = torch.device("cpu")
+        # Initialize ROS stuff
         super().__init__('arm_controller')
         self.subscription  = self.create_subscription(DuelBotObservation, OBSERVATION_TOPIC, self.observation_response, QUEUE_LENGTH)
         self._publisher = self.create_publisher(Float64MultiArray, COMMAND_TOPIC, QUEUE_LENGTH)
         self.reset_client = self.create_client(Trigger, RESET_SERVICE)
-        self.pause_publishing = False
         # Initial Reset
         print("Waiting for reset service registration")
         self.reset_client.wait_for_service()
         self.training_reset()
+    
+    def run(self, model: ActorCritic):
+        """
+        Run the controller with the given model indefinitely
+        """
+        self.model = model
+        self.is_running = True
+    
+    def training_reset(self):
+        print("Resetting")
+        self.is_resetting = True
+        self.reset_client.wait_for_service()
+        reset_fut = self.reset_client.call_async(Trigger.Request())
+        reset_fut.add_done_callback(self.on_reset_complete)
+    
+    def on_reset_complete(self, fut: Future):
+        resp = fut.result()
+        if resp.success: self.is_resetting = False
+        else: raise Exception("Reset failed (resp.success = false)")
 
+    def observation_response(self, msg: DuelBotObservation):
+        # If node is in paused state, do nothing
+        if not self.is_running or self.is_resetting:
+            return None
+        # If the cube was hit, reset everything and exit
+        if msg.hit_target:
+            self.training_reset()
+            return None
+        # Combine all data into an array for training
+        model_ipts = self.pack_observation(msg)
+        # Run the model to see the output
+        model_outs, _, _ = self.run_model(model_ipts)
+        # Publish the command message based off of the model's output
+        self.publish_command(model_outs.numpy())
+
+    def pack_observation(self, msg: DuelBotObservation) -> torch.FloatTensor:
+        model_ipts = [
+            msg.relative_target_position.x, msg.relative_target_position.y, msg.relative_target_position.z,
+            msg.sword_rotation.x, msg.sword_rotation.y, msg.sword_rotation.z, msg.sword_rotation.w,
+            msg.shoulder_rotation.x, msg.shoulder_rotation.y, msg.shoulder_rotation.z, msg.shoulder_rotation.w,
+            msg.elbow_rotation,
+            msg.wrist_rotation.x, msg.wrist_rotation.y, msg.wrist_rotation.z, msg.wrist_rotation.w,
+            msg.shoulder_vel.x, msg.shoulder_vel.y, msg.shoulder_vel.z,
+            msg.elbow_vel,
+            msg.wrist_vel.x, msg.wrist_vel.y, msg.wrist_vel.z
+        ]
+        return torch.FloatTensor(np.array(model_ipts, dtype=float))
+    
+    def publish_command(self, cmd: np.ndarray):
+        to_publish = Float64MultiArray()
+        to_publish.data = cmd.tolist()
+        self._publisher.publish(to_publish)
+
+    def run_model(self, ipts: torch.Tensor) -> tuple[torch.Tensor,torch.Tensor,torch.Tensor]:  
+        if self.model:
+            with torch.no_grad():
+                obs_tensor = ipts.unsqueeze(0).to(self.device)
+                action, log_prob, _, value = self.model.get_action_and_value(obs_tensor)
+            return action, log_prob, value
+        else: 
+            return torch.empty(OUTPUT_SIZE).uniform_(-1.0, 1.0), torch.zeros(1), torch.zeros(1)
+        
     # NOTE: Not used currently for readability's sake
     def _flatten_message(self, msg: DuelBotObservation):
         """
@@ -40,51 +122,129 @@ class ArmCommander(Node):
             else: # Atomic value
                 flat_list.append(float(value))
         return flat_list
+
+class ArmTrainer(ArmCommander):
+    def __init__(self):
+        # Initialize training state
+        self.rollout_buffer: list[RolloutRecord] = []    # Stores the episode history
+        self.steps_requested = 0    # How many steps to collect?
+        self.pending_step = None
+        self.last_obs = None
+        # Standard commander initialization
+        super().__init__()
     
-    def training_reset(self):
-        print("Resetting")
-        self.pause_publishing = True
-        self.reset_client.wait_for_service()
-        reset_fut = self.reset_client.call_async(Trigger.Request())
-        reset_fut.add_done_callback(self.on_reset_complete)
-    
-    def on_reset_complete(self, fut: Future):
-        resp = fut.result()
-        if resp.success: self.pause_publishing = False
-        else: raise Exception("Reset failed (resp.success = false)")
+    def train(self, model: ActorCritic, steps: int):
+        # Reset training state + set is_collecting to True
+        self.rollout_buffer = []
+        self.model = model
+        self.steps_requested = steps
+        self.is_running = True
+        # Reset arm/environment
+        self.training_reset()
 
     def observation_response(self, msg: DuelBotObservation):
-        # If node is in paused state, do nothing
-        if self.pause_publishing:
-            print("PUBLISHING PAUSED!")
-            return None
-        # If the cube was hit, reset everything and exit
+        if not self.is_running or self.is_resetting: return
+        # Mark down reward and done for last action
+        if self.pending_step:
+            last_ac_reward = self.reward(msg)
+            self.pending_step.reward = last_ac_reward
+            self.pending_step.done = msg.hit_target
+            self.rollout_buffer.append(self.pending_step)
+            self.pending_step = None
+        # Determine whether to reset or finish the 
         if msg.hit_target:
             self.training_reset()
-            return None
-        # Combine all data into an array for training
-        model_ipts = [
-            msg.relative_target_position.x, msg.relative_target_position.y, msg.relative_target_position.z,
-            msg.sword_rotation.x, msg.sword_rotation.y, msg.sword_rotation.z, msg.sword_rotation.w,
-            msg.shoulder_rotation.x, msg.shoulder_rotation.y, msg.shoulder_rotation.z, msg.shoulder_rotation.w,
-            msg.elbow_rotation,
-            msg.wrist_rotation.x, msg.wrist_rotation.y, msg.wrist_rotation.z, msg.wrist_rotation.w,
-            msg.shoulder_vel.x, msg.shoulder_vel.y, msg.shoulder_vel.z,
-            msg.elbow_vel,
-            msg.wrist_vel.x, msg.wrist_vel.y, msg.wrist_vel.z
-        ]
-        model_ipts = np.array(model_ipts, dtype=float)
-        # Run the model to see the output
-        model_outs = self.run_model(model_ipts)
-        # Publish the command message based off of the model's output
-        to_publish = Float64MultiArray()
-        to_publish.data = model_outs.tolist()
-        print("Publishing", model_outs.tolist())
-        self._publisher.publish(to_publish)
+            return # Hmmm, what about messages inflight before reset registers?
+        if len(self.rollout_buffer) >= self.steps_requested:
+            self.last_obs = self.pack_observation(msg)
+            self.finish_rollout()
+        # Determine next action and mark down decision
+        model_ipts = self.pack_observation(msg)
+        action, log_prob, value = self.run_model(model_ipts)
+        action_np = action.cpu().numpy().flatten()
+        self.pending_step = RolloutRecord(model_ipts, action_np, log_prob.item(), value.item(), None, None)
+        # Publish action to take
+        self.publish_command(action_np)
 
-    def run_model(self, ipts: np.ndarray[float]) -> np.ndarray[float]:  
-        # Normally, we'd run the model here but for now, just some rando data
-        return np.random.uniform(-1.0, 1.0, 7)
+    def reward(self, msg: DuelBotObservation):
+        """ The Judge """
+        reward = 0.0
+        # Distance Penalty (Minimize distance to target)
+        # 1. Get the Blade Tip position in World Space (Relative to handle)
+        # We start with the local direction, rotate it, and scale by length
+        quat = [msg.sword_rotation.x, msg.sword_rotation.y, msg.sword_rotation.z, msg.sword_rotation.w]
+        
+        # Rotate the local axis by the sword's current rotation
+        tip_direction = rotate_vector_by_quaternion(BLADE_AXIS_LOCAL, quat)
+        
+        # Scale by length to get the actual Tip Vector (B)
+        tip_vector = tip_direction * BLADE_LENGTH
+        
+        # 2. Calculate Distance from Target Block to the Line Segment (Handle->Tip)
+        # msg.relative_target_position is effectively our Point P (since handle is 0,0,0)
+        dist = point_line_segment_distance(
+            msg.relative_target_position.x, 
+            msg.relative_target_position.y, 
+            msg.relative_target_position.z,
+            tip_vector[0], tip_vector[1], tip_vector[2]
+        )
+        dist = np.linalg.norm([msg.relative_target_position.x, msg.relative_target_position.y, msg.relative_target_position.z])
+        reward -= dist * 0.5
+        # Hit Reward
+        if msg.hit_target: reward += 10.0
+        return reward
+    
+    def finish_rollout(self):
+        """ Stop collection and signal the trainer """
+        self.is_running = False
+        print(f"Collection Complete! Buffer Size: {len(self.rollout_buffer)}")
+        # Stop the robot so it doesn't drift while we train
+        self.publish_command(np.zeros(7))
+
+#
+# MATH helper functions
+# 
+        
+def rotate_vector_by_quaternion(v, q):
+    """
+    Rotates vector v (x,y,z) by quaternion q (x,y,z,w).
+    Uses the Rodrigues' rotation formula simplified for quaternions.
+    """
+    v = np.array(v)
+    q_vec = np.array(q[:3]) # x, y, z
+    q_scalar = q[3]         # w
+    
+    # Formula: v + 2.0 * cross(q_vec, cross(q_vec, v) + q_scalar * v)
+    return v + 2.0 * np.cross(q_vec, np.cross(q_vec, v) + q_scalar * v)
+
+def point_line_segment_distance(px, py, pz, line_end_x, line_end_y, line_end_z):
+    """
+    Calculates distance from Point P to the Segment (0,0,0)->(LineEnd)
+    """
+    # P: The target position vector relative to the handle
+    p = np.array([px, py, pz])
+    
+    # B: The tip of the sword relative to the handle
+    b = np.array([line_end_x, line_end_y, line_end_z])
+    
+    # Calculate squared length of the blade
+    len_sq = np.dot(b, b)
+    if len_sq == 0: return np.linalg.norm(p) # Safety check
+    
+    # Project P onto B (The dot product gives the "shadow" length)
+    # t is the percentage (0.0 to 1.0) of how far along the blade the closest point is
+    t = np.dot(p, b) / len_sq
+    
+    # Clamp t to the segment [0, 1] (Handle to Tip)
+    t = np.clip(t, 0.0, 1.0)
+    
+    # Find the closest point C on the line
+    closest_point = b * t
+    
+    # Return distance between Target (P) and Closest Point (C)
+    return np.linalg.norm(p - closest_point)
+
+
 
 def main():
     rclpy.init()
