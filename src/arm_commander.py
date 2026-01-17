@@ -148,7 +148,7 @@ class ArmTrainer(ArmCommander):
         # Initialize episodic/time-step training state
         self.pending_step = None 
         self.last_dist = None
-        self.initial_dist = None
+        self.closest_dist = None
         # Standard commander initialization
         super().__init__()
     
@@ -164,7 +164,7 @@ class ArmTrainer(ArmCommander):
     def self_training_reset(self):
         self.pending_step = None
         self.last_dist = None
-        self.initial_dist = None
+        self.closest_dist = None
     
     def episode_reset(self):
         self.training_reset()
@@ -172,9 +172,6 @@ class ArmTrainer(ArmCommander):
 
     def observation_response(self, msg: DuelBotObservation):
         if not self.is_running or self.is_resetting: return
-        # Set initial dist if it's unset (beginning of episode)
-        if self.initial_dist is None:
-            self.initial_dist = np.linalg.norm(to_numpy(msg.target_position) - to_numpy(msg.closest_blade_position))
         # Mark down reward and done for last action
         too_far = False
         if self.pending_step:
@@ -214,20 +211,21 @@ class ArmTrainer(ArmCommander):
         # Delta Distance Reward
         dist = np.linalg.norm(to_numpy(msg.target_position) - to_numpy(msg.closest_blade_position))
         if self.last_dist is not None:
-            incr = (self.last_dist - dist) * 20
+            delta_dist = self.last_dist - dist
+            incr = (self.last_dist - dist) * 5
+            if delta_dist > 0: incr += 0.05
             reward += incr
-        else:
-            print("no incr")
         self.last_dist = dist
         # End episode with big penalty if the sword has drifted too far
-        too_far = dist > self.initial_dist*1.5 + 0.5
+        if not self.closest_dist or self.closest_dist > dist:
+            self.closest_dist = dist
+        too_far = dist > self.closest_dist + 0.5
         if too_far: reward -= 5
-        # Absolute Distance Penalty
-        # NOTE: Not implemented yet
-        # Time Penalty
-        reward -= 0.001 # Penalty simply for existing during this timestep
+        # Absolute Distance Penalty (replacing temporal penalty)
+        reward -= dist*0.01
         # Hit Reward
         if msg.hit_target: reward += 10.0
+        print(reward)
         return reward, too_far
     
     def finish_rollout(self):

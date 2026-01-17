@@ -8,7 +8,7 @@ import numpy as np
 torch.autograd.set_detect_anomaly(True)
 
 BATCH_STEPS = 2048
-INIT_MODEL_WEIGHTS = "saved_mod1.pth"
+INIT_MODEL_WEIGHTS = None#"saved_models/saved_mod1.pth"
 
 def train(model: ActorCritic, total_steps: int = 100_000):
     rclpy.init()
@@ -30,7 +30,8 @@ def train(model: ActorCritic, total_steps: int = 100_000):
             buffer = controller.rollout_buffer
             loss = ppo_update(model, optimizer, buffer, controller.final_obs)
             steps_taken += len(buffer)
-            print(f"Update Complete. Loss: {loss:.4f} | Total Steps: {steps_taken}")
+            total_reward = sum([record.reward for record in buffer])
+            print(f"Update Complete. Loss: {loss:.4f} | Total Reward: {total_reward:.4f}| Total Steps: {steps_taken}")
             # Optional: Save Model
             if steps_taken % (BATCH_STEPS * 10) == 0:
                 print("Saving incremental model")
