@@ -1,6 +1,9 @@
 # Sword Information
-geometry_msgs/Vector3 relative_target_position
-geometry_msgs/Quaternion sword_rotation
+geometry_msgs/Vector3 handle_position
+geometry_msgs/Vector3 tip_position
+geometry_msgs/Vector3 closest_blade_position
+# Target Information
+geometry_msgs/Vector3 target_position
 # Joint Rotations
 geometry_msgs/Quaternion shoulder_rotation
 float32 elbow_rotation

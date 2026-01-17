@@ -5,11 +5,16 @@ import torch
 from torch import nn
 import numpy as np
 
+torch.autograd.set_detect_anomaly(True)
+
 BATCH_STEPS = 2048
+INIT_MODEL_WEIGHTS = "saved_mod1.pth"
 
 def train(model: ActorCritic, total_steps: int = 100_000):
     rclpy.init()
     controller = ArmTrainer()
+    if INIT_MODEL_WEIGHTS:
+        model.load_state_dict(torch.load(INIT_MODEL_WEIGHTS))
     model = model.to(torch.device("cpu"))
     optimizer = torch.optim.Adam(model.parameters(), lr=3e-4)
     steps_taken = 0
@@ -23,18 +28,18 @@ def train(model: ActorCritic, total_steps: int = 100_000):
             # Update model based on collected experiences during training
             print("Updating Policy...")
             buffer = controller.rollout_buffer
-            loss = ppo_update(model, optimizer, buffer, controller.last_obs)
+            loss = ppo_update(model, optimizer, buffer, controller.final_obs)
             steps_taken += len(buffer)
             print(f"Update Complete. Loss: {loss:.4f} | Total Steps: {steps_taken}")
             # Optional: Save Model
             if steps_taken % (BATCH_STEPS * 10) == 0:
                 print("Saving incremental model")
                 torch.save(model.state_dict(), "duelbot_ppo.pth")
+        print("Saving FINAL model")
+        torch.save(model.state_dict(), "duelbot_ppo.pth")
     except KeyboardInterrupt:
         print("Stopping...")
     finally:
-        print("Saving FINAL model")
-        torch.save(model.state_dict(), "duelbot_ppo.pth")
         controller.destroy_node()
         rclpy.shutdown()
 
@@ -72,7 +77,7 @@ def compute_gae(buffer: list[RolloutRecord], last_value: float, gamma=0.99, gae_
     return torch.tensor(returns), torch.tensor(advantages)
 
 def ppo_update(model: ActorCritic, optimizer: torch.optim.Optimizer, buffer: list[RolloutRecord], 
-               last_obs_tensor: torch.Tensor, batch_size=64, epochs=10, clip_coef=0.2, ent_coef=0.01):
+               final_obs_tensor: torch.Tensor, batch_size=64, epochs=10, clip_coef=0.2, ent_coef=0.01):
     """
     The Main PPO Learning Loop.
     """
@@ -81,7 +86,7 @@ def ppo_update(model: ActorCritic, optimizer: torch.optim.Optimizer, buffer: lis
     # --- PRE-PROCESSING ---
     # 1. Calculate 'Last Value' for bootstrapping GAE
     with torch.no_grad():
-        last_value = model.get_value(last_obs_tensor)
+        last_value = model.get_value(final_obs_tensor)
         last_value = last_value.item()
 
     # 2. Compute Returns and Advantages
@@ -114,7 +119,7 @@ def ppo_update(model: ActorCritic, optimizer: torch.optim.Optimizer, buffer: lis
             mb_actions = act_batch[mb_indices]
             mb_old_log_probs = old_log_probs[mb_indices]
             mb_advantages = advantages[mb_indices]
-            mb_returns = returns[mb_indices]
+            mb_returns = returns[mb_indices] # Advantage + value
             
             # 2. Run Model on Mini-batch
             # We pass mb_actions to get the log_prob of the SPECIFIC actions we took
@@ -131,9 +136,10 @@ def ppo_update(model: ActorCritic, optimizer: torch.optim.Optimizer, buffer: lis
             
             # 5. Value Loss (MSE between predicted value and actual return)
             # Flatten values just in case
-            value_loss = 0.5 * ((new_values.view(-1) - mb_returns) ** 2).mean()
+            value_loss = ((new_values.view(-1) - mb_returns) ** 2).mean()
             
             # 6. Entropy Loss (Encourage exploration)
+            # This name is a bit misleading since it gets subtracted from overall loss but whatever
             entropy_loss = entropy.mean()
             
             # 7. Total Loss

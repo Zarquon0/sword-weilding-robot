@@ -1,6 +1,7 @@
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import Point, Vector3, Quaternion
 from duel_msgs.msg import DuelBotObservation
 from std_srvs.srv import Trigger
 from rclpy.task import Future   
@@ -10,6 +11,8 @@ from dataclasses import dataclass
 from actor_critic import ActorCritic
 import torch
 
+np.seterr(all='raise')
+
 OBSERVATION_TOPIC = "arm_observations"
 COMMAND_TOPIC = "arm_command_targets"
 RESET_SERVICE = "duel_bot/reset"
@@ -17,7 +20,7 @@ QUEUE_LENGTH = 10
 OUTPUT_SIZE = 7
 # FREQUENCY = 20 # In hertz
 BLADE_LENGTH = 0.7  # Meters 
-BLADE_AXIS_LOCAL = [0, 0, -1] # -Z
+BLADE_AXIS_LOCAL = [0, 1, 0] # +Y
 
 @dataclass()
 class RolloutRecord:
@@ -27,6 +30,14 @@ class RolloutRecord:
     value: float
     reward: float | None
     done: bool | None
+
+# UTILITY
+def to_numpy(ros_vec: Point | Vector3 | Quaternion) -> np.ndarray:
+    """Converts Point, Vector3, or Quaternion msg to a numpy array."""
+    if hasattr(ros_vec, 'w'): #Quaternion
+        return np.array([ros_vec.x, ros_vec.y, ros_vec.z, ros_vec.w], dtype=np.float32)
+    else: #Vector or Point
+        return np.array([ros_vec.x, ros_vec.y, ros_vec.z], dtype=np.float32)
 
 class ArmCommander(Node):
     def __init__(self):
@@ -80,17 +91,22 @@ class ArmCommander(Node):
         self.publish_command(model_outs.numpy())
 
     def pack_observation(self, msg: DuelBotObservation) -> torch.FloatTensor:
-        model_ipts = [
-            msg.relative_target_position.x, msg.relative_target_position.y, msg.relative_target_position.z,
-            msg.sword_rotation.x, msg.sword_rotation.y, msg.sword_rotation.z, msg.sword_rotation.w,
-            msg.shoulder_rotation.x, msg.shoulder_rotation.y, msg.shoulder_rotation.z, msg.shoulder_rotation.w,
-            msg.elbow_rotation,
-            msg.wrist_rotation.x, msg.wrist_rotation.y, msg.wrist_rotation.z, msg.wrist_rotation.w,
-            msg.shoulder_vel.x, msg.shoulder_vel.y, msg.shoulder_vel.z,
-            msg.elbow_vel,
-            msg.wrist_vel.x, msg.wrist_vel.y, msg.wrist_vel.z
-        ]
-        return torch.FloatTensor(np.array(model_ipts, dtype=float))
+        targ_pos = to_numpy(msg.target_position)
+        tip_to_target = targ_pos - to_numpy(msg.tip_position)
+        handle_to_target = targ_pos - to_numpy(msg.handle_position)
+        closest_to_target = targ_pos - to_numpy(msg.closest_blade_position)
+        model_ipts = np.concatenate([
+            tip_to_target,
+            handle_to_target,
+            closest_to_target,
+            to_numpy(msg.shoulder_rotation),
+            np.array([msg.elbow_rotation], dtype=np.float32),
+            to_numpy(msg.wrist_rotation),
+            to_numpy(msg.shoulder_vel),
+            np.array([msg.elbow_vel], dtype=np.float32),
+            to_numpy(msg.wrist_vel),
+        ])
+        return torch.FloatTensor(model_ipts)
     
     def publish_command(self, cmd: np.ndarray):
         to_publish = Float64MultiArray()
@@ -125,11 +141,14 @@ class ArmCommander(Node):
 
 class ArmTrainer(ArmCommander):
     def __init__(self):
-        # Initialize training state
+        # Initialize overarching training state
         self.rollout_buffer: list[RolloutRecord] = []    # Stores the episode history
         self.steps_requested = 0    # How many steps to collect?
-        self.pending_step = None
-        self.last_obs = None
+        self.final_obs = None
+        # Initialize episodic/time-step training state
+        self.pending_step = None 
+        self.last_dist = None
+        self.initial_dist = None
         # Standard commander initialization
         super().__init__()
     
@@ -140,23 +159,36 @@ class ArmTrainer(ArmCommander):
         self.steps_requested = steps
         self.is_running = True
         # Reset arm/environment
+        self.episode_reset()
+
+    def self_training_reset(self):
+        self.pending_step = None
+        self.last_dist = None
+        self.initial_dist = None
+    
+    def episode_reset(self):
         self.training_reset()
+        self.self_training_reset()
 
     def observation_response(self, msg: DuelBotObservation):
         if not self.is_running or self.is_resetting: return
+        # Set initial dist if it's unset (beginning of episode)
+        if self.initial_dist is None:
+            self.initial_dist = np.linalg.norm(to_numpy(msg.target_position) - to_numpy(msg.closest_blade_position))
         # Mark down reward and done for last action
+        too_far = False
         if self.pending_step:
-            last_ac_reward = self.reward(msg)
+            last_ac_reward, too_far = self.reward(msg)
             self.pending_step.reward = last_ac_reward
             self.pending_step.done = msg.hit_target
             self.rollout_buffer.append(self.pending_step)
             self.pending_step = None
-        # Determine whether to reset or finish the 
-        if msg.hit_target:
-            self.training_reset()
-            return # Hmmm, what about messages inflight before reset registers?
+        # Determine whether to reset or finish the episode
+        if msg.hit_target or too_far:
+            self.episode_reset()
+            return 
         if len(self.rollout_buffer) >= self.steps_requested:
-            self.last_obs = self.pack_observation(msg)
+            self.final_obs = self.pack_observation(msg)
             self.finish_rollout()
         # Determine next action and mark down decision
         model_ipts = self.pack_observation(msg)
@@ -169,30 +201,34 @@ class ArmTrainer(ArmCommander):
     def reward(self, msg: DuelBotObservation):
         """ The Judge """
         reward = 0.0
-        # Distance Penalty (Minimize distance to target)
-        # 1. Get the Blade Tip position in World Space (Relative to handle)
-        # We start with the local direction, rotate it, and scale by length
-        quat = [msg.sword_rotation.x, msg.sword_rotation.y, msg.sword_rotation.z, msg.sword_rotation.w]
-        
-        # Rotate the local axis by the sword's current rotation
-        tip_direction = rotate_vector_by_quaternion(BLADE_AXIS_LOCAL, quat)
-        
-        # Scale by length to get the actual Tip Vector (B)
-        tip_vector = tip_direction * BLADE_LENGTH
-        
-        # 2. Calculate Distance from Target Block to the Line Segment (Handle->Tip)
-        # msg.relative_target_position is effectively our Point P (since handle is 0,0,0)
-        dist = point_line_segment_distance(
-            msg.relative_target_position.x, 
-            msg.relative_target_position.y, 
-            msg.relative_target_position.z,
-            tip_vector[0], tip_vector[1], tip_vector[2]
-        )
-        dist = np.linalg.norm([msg.relative_target_position.x, msg.relative_target_position.y, msg.relative_target_position.z])
-        reward -= dist * 0.5
+        # quat = [msg.sword_rotation.x, msg.sword_rotation.y, msg.sword_rotation.z, msg.sword_rotation.w]
+        # tip_direction = rotate_vector_by_quaternion(BLADE_AXIS_LOCAL, quat)
+        # tip_vector = tip_direction * BLADE_LENGTH
+        # dist = point_line_segment_distance(
+        #     msg.relative_target_position.x, 
+        #     msg.relative_target_position.y, 
+        #     msg.relative_target_position.z,
+        #     tip_vector[0], tip_vector[1], tip_vector[2]
+        # )
+        # dist = np.linalg.norm([msg.relative_target_position.x, msg.relative_target_position.y, msg.relative_target_position.z])
+        # Delta Distance Reward
+        dist = np.linalg.norm(to_numpy(msg.target_position) - to_numpy(msg.closest_blade_position))
+        if self.last_dist is not None:
+            incr = (self.last_dist - dist) * 20
+            reward += incr
+        else:
+            print("no incr")
+        self.last_dist = dist
+        # End episode with big penalty if the sword has drifted too far
+        too_far = dist > self.initial_dist*1.5 + 0.5
+        if too_far: reward -= 5
+        # Absolute Distance Penalty
+        # NOTE: Not implemented yet
+        # Time Penalty
+        reward -= 0.001 # Penalty simply for existing during this timestep
         # Hit Reward
         if msg.hit_target: reward += 10.0
-        return reward
+        return reward, too_far
     
     def finish_rollout(self):
         """ Stop collection and signal the trainer """
